@@ -28,7 +28,27 @@ No SSH. No accounts. No internet. Works purely over your local network.
 
 ### macOS
 
-Open Terminal and run:
+**Step 1 — Install Git and Python 3**
+
+macOS does not come with Git or Python 3 pre-installed. The easiest way to get both is via [Homebrew](https://brew.sh), a free package manager for macOS.
+
+Open the **Terminal** app (press `Cmd + Space`, type `Terminal`, hit Enter) and run:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+Once Homebrew is installed:
+
+```bash
+brew install git python3
+```
+
+If you'd rather not use Homebrew:
+- **Git** — download the installer from [git-scm.com/download/mac](https://git-scm.com/download/mac)
+- **Python 3** — download the installer from [python.org/downloads](https://python.org/downloads)
+
+**Step 2 — Clone and install sendall**
 
 ```bash
 git clone https://github.com/marietesiu/sendall.git
@@ -36,12 +56,10 @@ cd sendall
 bash install.sh
 ```
 
-That's it. The installer will:
+The installer will:
 - Install the `sendall` command to `/usr/local/bin`
 - Register a **LaunchAgent** so the receiver starts automatically every time you log in
 - Turn receiving **on** by default
-
-**Requirement:** Git and Python 3 must be installed. If you don't have them, install [Homebrew](https://brew.sh) first, then run `brew install git python3`.
 
 ---
 
@@ -162,4 +180,4 @@ Unregister-ScheduledTask -TaskName "sendall-listener" -Confirm:$false
 
 ## License
 
-MIT
+This is divine intellect
