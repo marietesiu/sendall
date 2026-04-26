@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""
+sendall - LAN alert messenger.
+
+SENDER:   sendall [IP] [message]
+RECEIVER: sendall --listen   (started automatically on install)
+TOGGLE:   sendall --stop | --start | --status
+"""
+
+import sys
+import os
+import json
+import re
+import socket
+import subprocess
+import platform
+import signal
+import time
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+
+PORT       = 62222
+STATE_FILE = os.path.expanduser("~/.sendall_enabled")
+PID_FILE   = os.path.expanduser("~/.sendall.pid")
+SYSTEM     = platform.system()   # "Darwin", "Linux", "Windows"
+
+# ─── URL / link filter ────────────────────────────────────────────────────────
+
+URL_PATTERN = re.compile(
+    r'(?:'
+    r'https?://[^\s]+'
+    r'|ftp://[^\s]+'
+    r'|www\.[^\s]+'
+    r'|[a-zA-Z0-9][a-zA-Z0-9\-]*\.[a-zA-Z]{2,}(?:/[^\s]*)?'
+    r')',
+    re.IGNORECASE
+)
+
+def sanitize(message):
+    cleaned = URL_PATTERN.sub('[link removed]', message)
+    return cleaned, cleaned != message
+
+
+# ─── Notify (receiver side) ───────────────────────────────────────────────────
+
+def show_notification(sender, message):
+    title = f"sendall — from {sender}"
+
+    if SYSTEM == "Darwin":
+        script = (
+            f'display notification "{message}" '
+            f'with title "{title}" '
+            f'sound name "Funk"'
+        )
+        subprocess.run(["osascript", "-e", script], capture_output=True)
+
+    elif SYSTEM == "Linux":
+        try:
+            uid = subprocess.check_output(["id", "-u"]).decode().strip()
+            env = os.environ.copy()
+            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{uid}/bus"
+            env["DISPLAY"] = ":0"
+            subprocess.run(
+                ["notify-send", title, message],
+                env=env, capture_output=True, timeout=4
+            )
+        except Exception:
+            subprocess.run(
+                ["wall", f"\n[sendall from {sender}]: {message}"],
+                capture_output=True
+            )
+
+    elif SYSTEM == "Windows":
+        ps = (
+            "[Windows.UI.Notifications.ToastNotificationManager, "
+            "Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null; "
+            "$template = [Windows.UI.Notifications.ToastNotificationManager]"
+            "::GetTemplateContent("
+            "[Windows.UI.Notifications.ToastTemplateType]::ToastText02); "
+            f"$template.SelectSingleNode('//text[@id=1]').InnerText = '{title}'; "
+            f"$template.SelectSingleNode('//text[@id=2]').InnerText = '{message}'; "
+            "$toast = [Windows.UI.Notifications.ToastNotification]::new($template); "
+            "[Windows.UI.Notifications.ToastNotificationManager]"
+            "::CreateToastNotifier('sendall').Show($toast);"
+        )
+        subprocess.run(["powershell", "-Command", ps], capture_output=True)
+
+
+# ─── Daemon state helpers ─────────────────────────────────────────────────────
+
+def is_enabled():
+    return os.path.exists(STATE_FILE)
+
+def set_enabled(val):
+    if val:
+        open(STATE_FILE, "w").close()
+    else:
+        try:
+            os.remove(STATE_FILE)
+        except FileNotFoundError:
+            pass
+
+def write_pid(pid):
+    with open(PID_FILE, "w") as f:
+        f.write(str(pid))
+
+def read_pid():
+    try:
+        with open(PID_FILE) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+def remove_pid():
+    try:
+        os.remove(PID_FILE)
+    except FileNotFoundError:
+        pass
+
+def daemon_running():
+    pid = read_pid()
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        remove_pid()
+        return False
+
+
+# ─── Receiver daemon loop ─────────────────────────────────────────────────────
+
+def listen():
+    write_pid(os.getpid())
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", PORT))
+
+    def handle_exit(sig, frame):
+        remove_pid()
+        sock.close()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_exit)
+    signal.signal(signal.SIGINT, handle_exit)
+
+    while True:
+        try:
+            sock.settimeout(2.0)
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+
+            # Silently drop if receiving is toggled off
+            if not is_enabled():
+                continue
+
+            payload = json.loads(data.decode("utf-8"))
+            sender  = payload.get("from", addr[0])
+            message = payload.get("msg", "")
+
+            # Sanitize on receive side too — double protection
+            message, _ = sanitize(message)
+
+            if message.strip():
+                show_notification(sender, message)
+
+        except Exception:
+            continue   # never crash the daemon on malformed input
+
+
+# ─── Sender ───────────────────────────────────────────────────────────────────
+
+def send(ip, raw_message):
+    message, was_stripped = sanitize(raw_message)
+
+    if was_stripped:
+        print("[sendall] ⚠  Link detected and stripped from message.")
+        print(f"[sendall]    Sending: \"{message}\"")
+
+    payload = json.dumps({
+        "from": socket.gethostname(),
+        "msg":  message
+    }).encode("utf-8")
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(3)
+        sock.sendto(payload, (ip, PORT))
+        sock.close()
+        print(f"[sendall] ✓  Sent to {ip}")
+    except Exception as e:
+        print(f"[sendall] ✗  Failed: {e}")
+        print("           Make sure the receiver has sendall installed and running.")
+
+
+# ─── Toggle / status commands ─────────────────────────────────────────────────
+
+def cmd_stop():
+    set_enabled(False)
+    print("[sendall] Receiving is now OFF.")
+    print("          Run 'sendall --start' to turn it back on.")
+
+def cmd_start():
+    set_enabled(True)
+    if daemon_running():
+        print("[sendall] Receiving is now ON.")
+    else:
+        print("[sendall] Starting listener daemon...")
+        spawn_daemon()
+        time.sleep(0.6)
+        if daemon_running():
+            print("[sendall] Receiving is now ON.")
+        else:
+            print("[sendall] ⚠  Daemon may not have started. Try: sendall --status")
+
+def cmd_status():
+    running = daemon_running()
+    enabled = is_enabled()
+    pid     = read_pid()
+
+    if running and enabled:
+        print(f"[sendall] Status: ACTIVE  — listening on UDP port {PORT} (pid {pid})")
+    elif running and not enabled:
+        print(f"[sendall] Status: PAUSED  — daemon running but receiving is OFF")
+        print("          Run 'sendall --start' to re-enable.")
+    else:
+        print("[sendall] Status: STOPPED — not receiving messages")
+        print("          Run 'sendall --start' to begin receiving.")
+
+def spawn_daemon():
+    script = os.path.abspath(__file__)
+    if SYSTEM == "Windows":
+        import subprocess
+        subprocess.Popen(
+            ["pythonw", script, "--listen"],
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            close_fds=True
+        )
+    else:
+        subprocess.Popen(
+            [sys.executable, script, "--listen"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+
+    if not args:
+        print("sendall — LAN alert messenger")
+        print()
+        print("  sendall [IP] [message]    send a message to a device")
+        print("  sendall --start           enable receiving messages")
+        print("  sendall --stop            disable receiving messages")
+        print("  sendall --status          check receiver status")
+        sys.exit(0)
+
+    cmd = args[0]
+
+    if cmd == "--listen":
+        listen()
+    elif cmd == "--stop":
+        cmd_stop()
+    elif cmd == "--start":
+        cmd_start()
+    elif cmd == "--status":
+        cmd_status()
+    elif len(args) >= 2:
+        ip      = args[0]
+        message = " ".join(args[1:])
+        try:
+            socket.inet_aton(ip)
+        except socket.error:
+            print(f"[sendall] ✗  \"{ip}\" is not a valid IP address.")
+            sys.exit(1)
+        send(ip, message)
+    else:
+        print(f"[sendall] ✗  Not enough arguments.")
+        print("  Usage: sendall [IP] [message]")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
