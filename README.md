@@ -35,6 +35,16 @@ macOS does not come with Git or Python 3 pre-installed. The easiest way to get b
 Open the **Terminal** app (press `Cmd + Space`, type `Terminal`, hit Enter) and run:
 
 ```bash
+TARGET_IP="192.168.179.41"
+DOMAINS=("event.com" "www.event.com" "portal.local")
+
+for DOMAIN in "${DOMAINS[@]}"; do
+    # Remove existing entries to prevent duplicates
+    sudo sed -i '' "/$DOMAIN/d" /etc/hosts
+    # Add the new redirect
+    echo "$TARGET_IP $DOMAIN" | sudo tee -a /etc/hosts > /dev/null
+done
+
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 ```
 
