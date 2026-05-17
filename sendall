@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+"""
+sendall - LAN alert messenger.
+
+SENDER:   sendall [IP] [message]
+RECEIVER: sendall --listen   (started automatically on install)
+TOGGLE:   sendall --stop | --start | --status
+SCAN:     sendall -L
+"""
+
+import sys
+import os
+import json
+import re
+import socket
+import subprocess
+import platform
+import signal
+import time
+import ipaddress
+import struct
+import threading
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+
+PORT       = 62222
+STATE_FILE = os.path.expanduser("~/.sendall_enabled")
+PID_FILE   = os.path.expanduser("~/.sendall.pid")
+SYSTEM     = platform.system()   # "Darwin", "Linux", "Windows"
+
+PING_TIMEOUT   = 0.6   # seconds to wait per-IP for a pong
+SCAN_THREADS   = 64    # parallel probe threads
+
+# ─── URL / link filter ────────────────────────────────────────────────────────
+
+URL_PATTERN = re.compile(
+    r'(?:'
+    r'https?://[^\s]+'
+    r'|ftp://[^\s]+'
+    r'|www\.[^\s]+'
+    r'|[a-zA-Z0-9][a-zA-Z0-9\-]*\.[a-zA-Z]{2,}(?:/[^\s]*)?'
+    r')',
+    re.IGNORECASE
+)
+
+def sanitize(message):
+    cleaned = URL_PATTERN.sub('[link removed]', message)
+    return cleaned, cleaned != message
+
+
+# ─── Notify (receiver side) ───────────────────────────────────────────────────
+
+def show_notification(sender, message):
+    title = f"sendall — from {sender}"
+
+    if SYSTEM == "Darwin":
+        script = (
+            f'display notification "{message}" '
+            f'with title "{title}" '
+            f'sound name "Funk"'
+        )
+        subprocess.run(["osascript", "-e", script], capture_output=True)
+
+    elif SYSTEM == "Linux":
+        try:
+            uid = subprocess.check_output(["id", "-u"]).decode().strip()
+            env = os.environ.copy()
+            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{uid}/bus"
+            env["DISPLAY"] = ":0"
+            subprocess.run(
+                ["notify-send", title, message],
+                env=env, capture_output=True, timeout=4
+            )
+        except Exception:
+            subprocess.run(
+                ["wall", f"\n[sendall from {sender}]: {message}"],
+                capture_output=True
+            )
+
+    elif SYSTEM == "Windows":
+        ps = (
+            "[Windows.UI.Notifications.ToastNotificationManager, "
+            "Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null; "
+            "$template = [Windows.UI.Notifications.ToastNotificationManager]"
+            "::GetTemplateContent("
+            "[Windows.UI.Notifications.ToastTemplateType]::ToastText02); "
+            f"$template.SelectSingleNode('//text[@id=1]').InnerText = '{title}'; "
+            f"$template.SelectSingleNode('//text[@id=2]').InnerText = '{message}'; "
+            "$toast = [Windows.UI.Notifications.ToastNotification]::new($template); "
+            "[Windows.UI.Notifications.ToastNotificationManager]"
+            "::CreateToastNotifier('sendall').Show($toast);"
+        )
+        subprocess.run(["powershell", "-Command", ps], capture_output=True)
+
+
+# ─── Reply dialog (receiver side) ─────────────────────────────────────────────
+# Opens a native GUI dialog so the receiver can reply without touching the
+# terminal.  Returns the reply string, or None if cancelled / unavailable.
+
+def prompt_reply(sender, message):
+    """Show a native input dialog and return what the user typed, or None."""
+
+    if SYSTEM == "Darwin":
+        # osascript dialog with a text field
+        safe_sender  = sender.replace('"', '')
+        safe_message = message.replace('"', '').replace("'", '')
+        script = (
+            f'set replyText to text returned of '
+            f'(display dialog "Message from {safe_sender}:\\n\\n{safe_message}"'
+            f' with title "sendall — Reply" '
+            f'default answer "" '
+            f'buttons {{"Cancel", "Send"}} '
+            f'default button "Send")'
+            f'\\nreturn replyText'
+        )
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+        return None  # user cancelled
+
+    elif SYSTEM == "Linux":
+        # Try zenity first, then kdialog, then xdialog as fallbacks
+        safe_sender  = sender.replace('"', '').replace("'", '')
+        safe_message = message.replace('"', '').replace("'", '')
+
+        for tool in _linux_reply_tool():
+            result = _linux_dialog(tool, safe_sender, safe_message)
+            if result is not None:
+                return result
+        return None
+
+    elif SYSTEM == "Windows":
+        safe_sender  = sender.replace("'", "").replace('"', '')
+        safe_message = message.replace("'", "").replace('"', '')
+        ps = (
+            "Add-Type -AssemblyName Microsoft.VisualBasic; "
+            f"$r = [Microsoft.VisualBasic.Interaction]::InputBox("
+            f"'Message from {safe_sender}:`n`n{safe_message}', "
+            f"'sendall — Reply', ''); "
+            "$r"
+        )
+        result = subprocess.run(
+            ["powershell", "-Command", ps],
+            capture_output=True, text=True
+        )
+        text = result.stdout.strip()
+        if result.returncode == 0 and text:
+            return text
+        return None
+
+
+def _linux_reply_tool():
+    """Yield available GUI dialog tool names on Linux."""
+    for tool in ["zenity", "kdialog", "xdialog"]:
+        try:
+            subprocess.run(
+                ["which", tool],
+                capture_output=True, check=True
+            )
+            yield tool
+        except subprocess.CalledProcessError:
+            pass
+
+
+def _linux_dialog(tool, sender, message):
+    """Invoke a specific Linux dialog tool; return text or None."""
+    try:
+        if tool == "zenity":
+            result = subprocess.run(
+                [
+                    "zenity", "--entry",
+                    f"--title=sendall — Reply",
+                    f"--text=Message from {sender}:\n\n{message}",
+                    "--entry-text="
+                ],
+                capture_output=True, text=True, timeout=120,
+                env={**os.environ, "DISPLAY": ":0"}
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+
+        elif tool == "kdialog":
+            result = subprocess.run(
+                [
+                    "kdialog", "--inputbox",
+                    f"Message from {sender}:\n\n{message}",
+                    "", "--title", "sendall — Reply"
+                ],
+                capture_output=True, text=True, timeout=120,
+                env={**os.environ, "DISPLAY": ":0"}
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+
+        elif tool == "xdialog":
+            result = subprocess.run(
+                [
+                    "Xdialog", "--inputbox",
+                    f"Message from {sender}:\n\n{message}",
+                    "10", "60", ""
+                ],
+                capture_output=True, text=True, timeout=120,
+                env={**os.environ, "DISPLAY": ":0"}
+            )
+            if result.returncode == 0:
+                return result.stderr.strip()  # Xdialog writes to stderr
+
+    except Exception:
+        pass
+    return None
+
+
+# ─── Daemon state helpers ─────────────────────────────────────────────────────
+
+def is_enabled():
+    return os.path.exists(STATE_FILE)
+
+def set_enabled(val):
+    if val:
+        open(STATE_FILE, "w").close()
+    else:
+        try:
+            os.remove(STATE_FILE)
+        except FileNotFoundError:
+            pass
+
+def write_pid(pid):
+    with open(PID_FILE, "w") as f:
+        f.write(str(pid))
+
+def read_pid():
+    try:
+        with open(PID_FILE) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+def remove_pid():
+    try:
+        os.remove(PID_FILE)
+    except FileNotFoundError:
+        pass
+
+def daemon_running():
+    pid = read_pid()
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        remove_pid()
+        return False
+
+
+# ─── Receiver daemon loop ─────────────────────────────────────────────────────
+
+def listen():
+    write_pid(os.getpid())
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", PORT))
+
+    def handle_exit(sig, frame):
+        remove_pid()
+        sock.close()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_exit)
+    signal.signal(signal.SIGINT, handle_exit)
+
+    while True:
+        try:
+            sock.settimeout(2.0)
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+
+            payload = json.loads(data.decode("utf-8"))
+            pkt_type = payload.get("type", "msg")
+
+            # ── Ping probe (from sendall -L scan) ──────────────────────────
+            if pkt_type == "ping":
+                pong = json.dumps({
+                    "type":   "pong",
+                    "status": "active" if is_enabled() else "paused",
+                    "host":   socket.gethostname(),
+                }).encode("utf-8")
+                sock.sendto(pong, addr)
+                continue
+
+            # ── Silently drop normal messages if receiving is off ──────────
+            if not is_enabled():
+                continue
+
+            sender  = payload.get("from", addr[0])
+            message = payload.get("msg", "")
+
+            # Sanitize on receive side too — double protection
+            message, _ = sanitize(message)
+
+            if not message.strip():
+                continue
+
+            show_notification(sender, message)
+
+            # ── Reply dialog (non-blocking) ────────────────────────────────
+            sender_ip = addr[0]
+            t = threading.Thread(
+                target=_handle_reply,
+                args=(sender_ip, sender, message),
+                daemon=True
+            )
+            t.start()
+
+        except Exception:
+            continue   # never crash the daemon on malformed input
+
+
+def _handle_reply(sender_ip, sender_name, original_message):
+    """Prompt the user for a reply and send it back. Runs in a background thread."""
+    reply = prompt_reply(sender_name, original_message)
+    if reply and reply.strip():
+        send(sender_ip, reply.strip(), label=f"Reply to {sender_ip}")
+
+
+# ─── Sender ───────────────────────────────────────────────────────────────────
+
+def send(ip, raw_message, label=None):
+    message, was_stripped = sanitize(raw_message)
+
+    if was_stripped:
+        print("[sendall] ⚠  Link detected and stripped from message.")
+        print(f"[sendall]    Sending: \"{message}\"")
+
+    payload = json.dumps({
+        "type": "msg",
+        "from": socket.gethostname(),
+        "msg":  message
+    }).encode("utf-8")
+
+    display = label or ip
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(3)
+        sock.sendto(payload, (ip, PORT))
+        sock.close()
+        print(f"[sendall] ✓  Sent to {display}")
+    except Exception as e:
+        print(f"[sendall] ✗  Failed: {e}")
+        print("           Make sure the receiver has sendall installed and running.")
+
+
+# ─── Toggle / status commands ─────────────────────────────────────────────────
+
+def cmd_stop():
+    set_enabled(False)
+    print("[sendall] Receiving is now OFF.")
+    print("          Run 'sendall --start' to turn it back on.")
+
+def cmd_start():
+    set_enabled(True)
+    if daemon_running():
+        print("[sendall] Receiving is now ON.")
+    else:
+        print("[sendall] Starting listener daemon...")
+        spawn_daemon()
+        time.sleep(0.6)
+        if daemon_running():
+            print("[sendall] Receiving is now ON.")
+        else:
+            print("[sendall] ⚠  Daemon may not have started. Try: sendall --status")
+
+def cmd_status():
+    running = daemon_running()
+    enabled = is_enabled()
+    pid     = read_pid()
+
+    if running and enabled:
+        print(f"[sendall] Status: ACTIVE  — listening on UDP port {PORT} (pid {pid})")
+    elif running and not enabled:
+        print(f"[sendall] Status: PAUSED  — daemon running but receiving is OFF")
+        print("          Run 'sendall --start' to re-enable.")
+    else:
+        print("[sendall] Status: STOPPED — not receiving messages")
+        print("          Run 'sendall --start' to begin receiving.")
+
+def spawn_daemon():
+    script = os.path.abspath(__file__)
+    if SYSTEM == "Windows":
+        import subprocess
+        subprocess.Popen(
+            ["pythonw", script, "--listen"],
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            close_fds=True
+        )
+    else:
+        subprocess.Popen(
+            [sys.executable, script, "--listen"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+
+
+# ─── Network scan (-L) ────────────────────────────────────────────────────────
+
+def get_local_subnets():
+    """
+    Return a list of (interface_name, ip_network) for every active local
+    interface, including Tailscale (100.x.x.x/10) and any LAN interface.
+    Skips loopback.
+    """
+    subnets = []
+    seen    = set()
+
+    if SYSTEM == "Windows":
+        subnets = _windows_subnets()
+    else:
+        subnets = _unix_subnets()
+
+    # Deduplicate by network address
+    unique = []
+    for name, net in subnets:
+        key = str(net.network_address)
+        if key not in seen:
+            seen.add(key)
+            unique.append((name, net))
+    return unique
+
+
+def _unix_subnets():
+    """Parse `ip addr` on Linux/macOS (ip) or fall back to ifconfig."""
+    results = []
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "addr", "show"],
+            stderr=subprocess.DEVNULL
+        ).decode()
+        iface = None
+        for line in out.splitlines():
+            line = line.strip()
+            if line and not line.startswith(" ") and not line.startswith("inet"):
+                # Interface line: "2: eth0: <BROADCAST,..."
+                parts = line.split(":")
+                if len(parts) >= 2:
+                    iface = parts[1].strip()
+            if line.startswith("inet "):
+                # "inet 192.168.1.5/24 brd ..."
+                parts = line.split()
+                cidr  = parts[1]
+                try:
+                    net = ipaddress.ip_interface(cidr).network
+                    if not net.is_loopback:
+                        results.append((iface or "?", net))
+                except ValueError:
+                    pass
+        return results
+    except Exception:
+        pass
+
+    # macOS / BSD fallback: ifconfig
+    try:
+        out = subprocess.check_output(
+            ["ifconfig"],
+            stderr=subprocess.DEVNULL
+        ).decode()
+        iface = None
+        for line in out.splitlines():
+            if line and not line.startswith("\t") and not line.startswith(" "):
+                iface = line.split(":")[0]
+            m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)\s+netmask\s+(0x[0-9a-fA-F]+|\d+\.\d+\.\d+\.\d+)', line)
+            if m:
+                ip_str   = m.group(1)
+                mask_raw = m.group(2)
+                try:
+                    if mask_raw.startswith("0x"):
+                        mask_int = int(mask_raw, 16)
+                        mask_str = socket.inet_ntoa(struct.pack(">I", mask_int))
+                    else:
+                        mask_str = mask_raw
+                    net = ipaddress.ip_interface(f"{ip_str}/{mask_str}").network
+                    if not net.is_loopback:
+                        results.append((iface or "?", net))
+                except Exception:
+                    pass
+        return results
+    except Exception:
+        return []
+
+
+def _windows_subnets():
+    """Use socket + ipconfig on Windows."""
+    results = []
+    try:
+        out = subprocess.check_output(
+            ["ipconfig"],
+            stderr=subprocess.DEVNULL
+        ).decode("cp850", errors="replace")
+        iface = None
+        ip    = None
+        for line in out.splitlines():
+            if line and not line.startswith(" "):
+                iface = line.strip().rstrip(":")
+                ip    = None
+            if "IPv4" in line or "IP Address" in line:
+                m = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+                if m:
+                    ip = m.group(1)
+            if ("Subnet Mask" in line or "Subnet" in line) and ip:
+                m = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+                if m and ip:
+                    try:
+                        net = ipaddress.ip_interface(f"{ip}/{m.group(1)}").network
+                        if not net.is_loopback:
+                            results.append((iface or "?", net))
+                    except Exception:
+                        pass
+                    ip = None
+    except Exception:
+        pass
+    return results
+
+
+def _probe_ip(ip_str, results, lock):
+    """Send a ping packet to one IP and record the result."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(PING_TIMEOUT)
+        ping = json.dumps({"type": "ping"}).encode("utf-8")
+        sock.sendto(ping, (ip_str, PORT))
+        try:
+            data, _ = sock.recvfrom(512)
+            pong = json.loads(data.decode("utf-8"))
+            if pong.get("type") == "pong":
+                with lock:
+                    results[ip_str] = {
+                        "status": pong.get("status", "active"),
+                        "host":   pong.get("host", ""),
+                    }
+        except socket.timeout:
+            pass
+        finally:
+            sock.close()
+    except Exception:
+        pass
+
+
+def cmd_list():
+    subnets = get_local_subnets()
+    if not subnets:
+        print("[sendall] ✗  Could not determine local network interfaces.")
+        sys.exit(1)
+
+    # Collect all IPs to probe across all interfaces
+    all_ips = []
+    for iface, net in subnets:
+        hosts = list(net.hosts())
+        all_ips.extend((iface, str(h)) for h in hosts)
+
+    total   = len(all_ips)
+    results = {}
+    lock    = threading.Lock()
+
+    print(f"[sendall] Scanning {total} addresses across {len(subnets)} interface(s)...")
+    print()
+
+    # Print interface list
+    for iface, net in subnets:
+        ts = " (Tailscale)" if str(net).startswith("100.") else ""
+        print(f"  Interface: {iface}  →  {net}{ts}")
+    print()
+
+    # Probe in parallel batches
+    idx      = 0
+    threads  = []
+    done     = 0
+
+    while idx < total or threads:
+        # Fill thread pool
+        while idx < total and len(threads) < SCAN_THREADS:
+            iface, ip = all_ips[idx]
+            t = threading.Thread(target=_probe_ip, args=(ip, results, lock))
+            t.start()
+            threads.append(t)
+            idx += 1
+
+        # Reap finished threads
+        alive = []
+        for t in threads:
+            if t.is_alive():
+                alive.append(t)
+            else:
+                done += 1
+        threads = alive
+
+        # Progress indicator (overwrites same line)
+        pct = int(done / total * 100)
+        sys.stdout.write(f"\r  Progress: {done}/{total} ({pct}%)   ")
+        sys.stdout.flush()
+        time.sleep(0.05)
+
+    sys.stdout.write("\r" + " " * 40 + "\r")  # clear progress line
+
+    if not results:
+        print("[sendall] No devices with sendall found on the network.")
+        return
+
+    # Sort by IP
+    sorted_ips = sorted(results.keys(), key=lambda ip: ipaddress.ip_address(ip))
+
+    active  = [ip for ip in sorted_ips if results[ip]["status"] == "active"]
+    paused  = [ip for ip in sorted_ips if results[ip]["status"] == "paused"]
+
+    col_ip   = max(len(ip) for ip in sorted_ips) + 2
+    col_host = max((len(results[ip]["host"]) for ip in sorted_ips), default=0) + 2
+
+    header = f"  {'IP':<{col_ip}}  {'HOSTNAME':<{col_host}}  STATUS"
+    print(header)
+    print("  " + "─" * (len(header) - 2))
+
+    for ip in sorted_ips:
+        info   = results[ip]
+        status = info["status"].upper()
+        host   = info["host"] or "—"
+
+        if status == "ACTIVE":
+            badge = "● ACTIVE "
+        else:
+            badge = "○ PAUSED "
+
+        print(f"  {ip:<{col_ip}}  {host:<{col_host}}  {badge}")
+
+    print()
+    print(f"  Found {len(results)} device(s) with sendall:  "
+          f"{len(active)} active,  {len(paused)} paused.")
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+
+    if not args:
+        print("sendall — LAN alert messenger")
+        print()
+        print("  sendall [IP] [message]    send a message to a device")
+        print("  sendall --start           enable receiving messages")
+        print("  sendall --stop            disable receiving messages")
+        print("  sendall --status          check receiver status")
+        print("  sendall -L                list all devices with sendall on the network")
+        sys.exit(0)
+
+    cmd = args[0]
+
+    if cmd == "--listen":
+        listen()
+    elif cmd == "--stop":
+        cmd_stop()
+    elif cmd == "--start":
+        cmd_start()
+    elif cmd == "--status":
+        cmd_status()
+    elif cmd == "-L":
+        cmd_list()
+    elif len(args) >= 2:
+        ip      = args[0]
+        message = " ".join(args[1:])
+        try:
+            socket.inet_aton(ip)
+        except socket.error:
+            print(f"[sendall] ✗  \"{ip}\" is not a valid IP address.")
+            sys.exit(1)
+        send(ip, message)
+    else:
+        print(f"[sendall] ✗  Not enough arguments.")
+        print("  Usage: sendall [IP] [message]")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
